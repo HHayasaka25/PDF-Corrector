@@ -4,9 +4,187 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QHBoxLayout, QListWidget, QGraphicsView, QGraphicsScene, 
                              QGraphicsPixmapItem, QSlider, QLabel, QPushButton, 
                              QComboBox, QButtonGroup, QSplitter, QDoubleSpinBox, 
-                             QFileDialog, QListWidgetItem, QCheckBox, QMessageBox, QGraphicsRectItem)
+                             QFileDialog, QListWidgetItem, QCheckBox, QMessageBox, 
+                             QGraphicsRectItem, QGraphicsObject, QGraphicsItem, QListView)
 from PyQt6.QtGui import QPixmap, QPainter, QAction, QImage, QIcon, QTransform, QPen, QColor, QBrush, QCursor
 from PyQt6.QtCore import Qt, QSize, QPointF, QLineF, QRectF, pyqtSignal, QByteArray, QBuffer, QIODevice
+
+class ThumbnailListWidget(QListWidget):
+    """幅に合わせてアイコンサイズを自動調整するサムネイルリスト"""
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        # 横スクロールバーを出さないようにする
+        self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        # ビューポートの幅から余白を引いて新しい幅を計算
+        w = max(50, self.viewport().width() - 25)
+        h = int(w * 1.414) # A4用紙に近いアスペクト比
+        
+        # アイコンのサイズを更新
+        self.setIconSize(QSize(w, h))
+        # 文字の高さを含めたマスのサイズ(グリッド)を更新
+        self.setGridSize(QSize(w + 5, h + 25))
+
+class ResizeHandle(QGraphicsObject):
+    """リサイズ用のハンドル（四隅と四辺の中点）"""
+    def __init__(self, pos_type, parent):
+        super().__init__(parent)
+        self.pos_type = pos_type
+        self.setAcceptHoverEvents(True)
+        # ズームしてもハンドルの見た目のサイズを一定に保つ
+        self.setFlag(QGraphicsItem.GraphicsItemFlag.ItemIgnoresTransformations)
+        self.size = 8
+        self._rect = QRectF(-self.size/2, -self.size/2, self.size, self.size)
+        
+        # 位置に応じたカーソル形状の設定
+        if pos_type in ('top_left', 'bottom_right'):
+            self.setCursor(Qt.CursorShape.SizeFDiagCursor)
+        elif pos_type in ('top_right', 'bottom_left'):
+            self.setCursor(Qt.CursorShape.SizeBDiagCursor)
+        elif pos_type in ('top', 'bottom'):
+            self.setCursor(Qt.CursorShape.SizeVerCursor)
+        elif pos_type in ('left', 'right'):
+            self.setCursor(Qt.CursorShape.SizeHorCursor)
+
+    def boundingRect(self):
+        return self._rect
+
+    def paint(self, painter, option, widget):
+        painter.setPen(QPen(QColor(0, 0, 0)))
+        painter.setBrush(QColor(255, 255, 255))
+        painter.drawRect(self._rect)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self.parentItem().handle_mouse_press(self.pos_type, event.scenePos())
+            event.accept()
+
+    def mouseMoveEvent(self, event):
+        self.parentItem().handle_mouse_move(self.pos_type, event.scenePos())
+        event.accept()
+
+    def mouseReleaseEvent(self, event):
+        self.parentItem().handle_mouse_release(self.pos_type, event.scenePos())
+        event.accept()
+
+class ResizableRectItem(QGraphicsObject):
+    """リサイズ・移動可能な選択範囲矩形"""
+    rect_changed = pyqtSignal(QRectF)
+
+    def __init__(self, rect=QRectF()):
+        super().__init__()
+        self._rect = rect
+        self.setAcceptHoverEvents(True)
+        self.setZValue(100)
+        
+        # 8つのハンドルを生成
+        self.handles = {}
+        for pos_type in ['top_left', 'top', 'top_right', 'right', 'bottom_right', 'bottom', 'bottom_left', 'left']:
+            handle = ResizeHandle(pos_type, self)
+            self.handles[pos_type] = handle
+            
+        self.update_handles()
+        
+        self._is_resizing = False
+        self._resize_handle = None
+        self._is_moving = False
+        self._move_start_pos = QPointF()
+        self._move_start_rect = QRectF()
+
+    def boundingRect(self):
+        # ハンドルが少しはみ出す分をマージンとして取る
+        return self._rect.adjusted(-10, -10, 10, 10)
+
+    def paint(self, painter, option, widget):
+        pen = QPen(QColor(255, 0, 0), 2, Qt.PenStyle.DashLine)
+        pen.setCosmetic(True) # ズームに関わらず線の太さを1px一定にする
+        painter.setPen(pen)
+        painter.setBrush(QColor(255, 0, 0, 40))
+        painter.drawRect(self._rect)
+
+    def rect(self):
+        return self._rect
+        
+    def setRect(self, rect):
+        self.prepareGeometryChange()
+        self._rect = rect
+        self.update_handles()
+        self.update()
+
+    def update_handles(self):
+        r = self._rect
+        self.handles['top_left'].setPos(r.topLeft())
+        self.handles['top'].setPos(r.left() + r.width()/2, r.top())
+        self.handles['top_right'].setPos(r.topRight())
+        self.handles['right'].setPos(r.right(), r.top() + r.height()/2)
+        self.handles['bottom_right'].setPos(r.bottomRight())
+        self.handles['bottom'].setPos(r.left() + r.width()/2, r.bottom())
+        self.handles['bottom_left'].setPos(r.bottomLeft())
+        self.handles['left'].setPos(r.left(), r.top() + r.height()/2)
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton:
+            self._is_moving = True
+            self._move_start_pos = event.scenePos()
+            self._move_start_rect = self._rect
+            event.accept()
+        else:
+            super().mousePressEvent(event)
+
+    def mouseMoveEvent(self, event):
+        if self._is_moving:
+            delta = event.scenePos() - self._move_start_pos
+            new_rect = self._move_start_rect.translated(delta)
+            self.setRect(new_rect)
+            event.accept()
+        else:
+            super().mouseMoveEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.MouseButton.LeftButton and self._is_moving:
+            self._is_moving = False
+            self.rect_changed.emit(self._rect)
+            event.accept()
+        else:
+            super().mouseReleaseEvent(event)
+
+    def hoverEnterEvent(self, event):
+        self.setCursor(Qt.CursorShape.SizeAllCursor)
+        super().hoverEnterEvent(event)
+        
+    def hoverLeaveEvent(self, event):
+        self.setCursor(Qt.CursorShape.ArrowCursor)
+        super().hoverLeaveEvent(event)
+
+    def handle_mouse_press(self, handle_type, pos):
+        self._is_resizing = True
+        self._resize_handle = handle_type
+        self._move_start_rect = self._rect
+
+    def handle_mouse_move(self, handle_type, pos):
+        if not self._is_resizing:
+            return
+        
+        r = QRectF(self._move_start_rect)
+        
+        if 'left' in handle_type:
+            r.setLeft(min(pos.x(), r.right() - 10))
+        elif 'right' in handle_type:
+            r.setRight(max(pos.x(), r.left() + 10))
+            
+        if 'top' in handle_type:
+            r.setTop(min(pos.y(), r.bottom() - 10))
+        elif 'bottom' in handle_type:
+            r.setBottom(max(pos.y(), r.top() + 10))
+            
+        self.setRect(r.normalized())
+
+    def handle_mouse_release(self, handle_type, pos):
+        self._is_resizing = False
+        self._resize_handle = None
+        self.rect_changed.emit(self._rect)
 
 class CustomGraphicsView(QGraphicsView):
     """プレビューキャンバス用のカスタムビュー（ズーム、パン、矩形選択機能付き）"""
@@ -23,7 +201,7 @@ class CustomGraphicsView(QGraphicsView):
         # 背景をグレーに変更
         self.setBackgroundBrush(QBrush(QColor(85, 85, 85))) # #555555
         
-        self.show_grid = False
+        self.show_grid = True
         self.current_tool = "rect" # "pen", "eraser", "rect"
         
         self._is_panning = False
@@ -86,6 +264,12 @@ class CustomGraphicsView(QGraphicsView):
             event.accept()
             
         elif event.button() == Qt.MouseButton.LeftButton and self.current_tool == "rect":
+            # 既存のハンドルや矩形の上をクリックした場合は、移動・リサイズイベントを優先
+            item = self.itemAt(event.position().toPoint())
+            if isinstance(item, (ResizableRectItem, ResizeHandle)):
+                super().mousePressEvent(event)
+                return
+
             self._is_drawing_rect = True
             self._rect_start = self.mapToScene(event.position().toPoint())
             
@@ -130,12 +314,12 @@ class CustomGraphicsView(QGraphicsView):
             self._is_drawing_rect = False
             if self._drawing_rect_item:
                 final_rect = self._drawing_rect_item.rect()
+                # 仮描画用アイテムは一度削除する（シグナル先でResizableRectItemとして再作成される）
+                self.scene().removeItem(self._drawing_rect_item)
+                self._drawing_rect_item = None
+                
                 if final_rect.width() > 10 and final_rect.height() > 10:
                     self.crop_rect_completed.emit(final_rect)
-                else:
-                    # ドラッグ範囲が小さすぎる場合はキャンセル扱い
-                    self.scene().removeItem(self._drawing_rect_item)
-                    self._drawing_rect_item = None
             event.accept()
         else:
             super().mouseReleaseEvent(event)
@@ -185,10 +369,16 @@ class PDFAdjuster(QMainWindow):
         main_layout.addWidget(main_splitter)
         
         # === 左パネル: サムネイル一覧 ===
-        self.thumbnail_list = QListWidget()
-        self.thumbnail_list.setFixedWidth(180)
-        self.thumbnail_list.setIconSize(QSize(120, 160))
-        self.thumbnail_list.setSpacing(5)
+        self.thumbnail_list = ThumbnailListWidget()
+        self.thumbnail_list.setMinimumWidth(120)
+        self.thumbnail_list.setViewMode(QListWidget.ViewMode.IconMode)
+        self.thumbnail_list.setMovement(QListWidget.Movement.Static)
+        self.thumbnail_list.setResizeMode(QListWidget.ResizeMode.Adjust)
+        
+        # 常に縦1列で表示し、横に折り返さない設定
+        self.thumbnail_list.setFlow(QListView.Flow.TopToBottom)
+        self.thumbnail_list.setWrapping(False)
+        
         self.thumbnail_list.itemSelectionChanged.connect(self.on_page_selected)
         main_splitter.addWidget(self.thumbnail_list)
         
@@ -201,8 +391,15 @@ class PDFAdjuster(QMainWindow):
         
         # === 右パネル: コントロール ===
         right_panel = QWidget()
-        right_panel.setFixedWidth(250)
+        right_panel.setMinimumWidth(250)
         control_layout = QVBoxLayout(right_panel)
+        
+        # PDFを開くボタン
+        self.btn_open = QPushButton("PDFを開く")
+        self.btn_open.clicked.connect(self.open_pdf_dialog)
+        self.btn_open.setStyleSheet("padding: 8px; font-weight: bold;")
+        control_layout.addWidget(self.btn_open)
+        control_layout.addSpacing(10)
         
         # 傾きコントロール
         control_layout.addWidget(QLabel("傾き調整 (度):"))
@@ -222,6 +419,7 @@ class PDFAdjuster(QMainWindow):
         
         # グリッド表示トグル
         self.grid_checkbox = QCheckBox("グリッドを表示")
+        self.grid_checkbox.setChecked(True)
         self.grid_checkbox.stateChanged.connect(self._on_grid_toggled)
         control_layout.addWidget(self.grid_checkbox)
         
@@ -263,6 +461,9 @@ class PDFAdjuster(QMainWindow):
         
         control_layout.addStretch()
         main_splitter.addWidget(right_panel)
+        
+        # スプリッターの初期サイズ比率を設定（左パネル, 中央キャンバス, 右パネル）
+        main_splitter.setSizes([180, 800, 250])
 
     def on_tool_changed(self, id, checked):
         if checked:
@@ -277,13 +478,21 @@ class PDFAdjuster(QMainWindow):
                 self.preview_view.setCursor(Qt.CursorShape.ArrowCursor)
 
     def on_crop_rect_drawn(self, rect):
-        """キャンバスで矩形が描かれたときの処理"""
+        """キャンバスで新規矩形が描画完了したときの処理"""
         if self.current_page_num != -1:
             self.page_states[self.current_page_num]['crop_rect'] = rect
-            # 既存のアイテムがあれば削除して参照を更新
+            
             if self.crop_rect_item:
                 self.scene.removeItem(self.crop_rect_item)
-            self.crop_rect_item = self.preview_view._drawing_rect_item
+                
+            self.crop_rect_item = ResizableRectItem(rect)
+            self.crop_rect_item.rect_changed.connect(self.on_crop_rect_modified)
+            self.scene.addItem(self.crop_rect_item)
+
+    def on_crop_rect_modified(self, new_rect):
+        """リサイズハンドルや移動によって矩形が変更されたときの処理"""
+        if self.current_page_num != -1:
+            self.page_states[self.current_page_num]['crop_rect'] = new_rect
 
     def open_pdf_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "PDFを開く", "", "PDF Files (*.pdf)")
@@ -303,12 +512,14 @@ class PDFAdjuster(QMainWindow):
         
         for i in range(len(self.pdf_doc)):
             page = self.pdf_doc[i]
-            pix = page.get_pixmap(matrix=fitz.Matrix(0.15, 0.15))
+            # アイコンが上限サイズで頭打ちにならないよう、生成解像度を大きくする(1.5倍)
+            pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
             fmt = QImage.Format.Format_RGBA8888 if pix.alpha else QImage.Format.Format_RGB888
             qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
             qpix = QPixmap.fromImage(qimg)
             
-            item = QListWidgetItem(QIcon(qpix), f"ページ {i+1}")
+            item = QListWidgetItem(QIcon(qpix), str(i+1))
+            item.setTextAlignment(Qt.AlignmentFlag.AlignCenter)
             item.setData(Qt.ItemDataRole.UserRole, i)
             self.thumbnail_list.addItem(item)
             
@@ -361,11 +572,8 @@ class PDFAdjuster(QMainWindow):
         # 記憶されている選択枠を描画
         saved_rect = self.page_states[page_num].get('crop_rect')
         if saved_rect:
-            self.crop_rect_item = QGraphicsRectItem(saved_rect)
-            pen = QPen(QColor(255, 0, 0), 2, Qt.PenStyle.DashLine)
-            self.crop_rect_item.setPen(pen)
-            self.crop_rect_item.setBrush(QColor(255, 0, 0, 40))
-            self.crop_rect_item.setZValue(100)
+            self.crop_rect_item = ResizableRectItem(saved_rect)
+            self.crop_rect_item.rect_changed.connect(self.on_crop_rect_modified)
             self.scene.addItem(self.crop_rect_item)
         
         self.preview_view.fitInView(self.scene.sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
