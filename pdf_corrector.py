@@ -6,20 +6,24 @@ from PyQt6.QtWidgets import (QApplication, QMainWindow, QWidget, QVBoxLayout,
                              QComboBox, QButtonGroup, QSplitter, QDoubleSpinBox, 
                              QFileDialog, QListWidgetItem, QCheckBox, QMessageBox, 
                              QGraphicsRectItem, QGraphicsObject, QGraphicsItem, QListView,
-                             QColorDialog, QSpinBox)
+                             QColorDialog, QSpinBox, QAbstractItemView)
 from PyQt6.QtGui import QPixmap, QPainter, QAction, QImage, QIcon, QTransform, QPen, QColor, QBrush, QCursor
 from PyQt6.QtCore import Qt, QSize, QPointF, QLineF, QRectF, pyqtSignal, QByteArray, QBuffer, QIODevice
 
 class ThumbnailListWidget(QListWidget):
-    """幅に合わせてアイコンサイズを自動調整するサムネイルリスト"""
+    """幅に合わせてアイコンサイズを自動調整し、滑らかにスクロールするサムネイルリスト"""
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAlwaysOff)
+        # スクロールをピクセル単位にして滑らかにする
+        self.setVerticalScrollMode(QAbstractItemView.ScrollMode.ScrollPerPixel)
+        self.verticalScrollBar().setSingleStep(15) # スクロール量を調整
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
+        # パネルの幅に合わせてアイテムのサイズを計算
         w = max(50, self.viewport().width() - 25)
-        h = int(w * 1.414)
+        h = int(w * 1.414) # A4比率
         self.setIconSize(QSize(w, h))
         self.setGridSize(QSize(w + 5, h + 25))
 
@@ -228,7 +232,7 @@ class CustomGraphicsView(QGraphicsView):
         painter.restore()
 
     def resizeEvent(self, event):
-        """★ウィンドウのリサイズに合わせてページをフィットさせる"""
+        """ウィンドウのリサイズに合わせてページをフィットさせる"""
         super().resizeEvent(event)
         if self.is_auto_fit and self.scene() and not self.scene().sceneRect().isEmpty():
             self.fitInView(self.scene().sceneRect(), Qt.AspectRatioMode.KeepAspectRatio)
@@ -280,7 +284,7 @@ class CustomGraphicsView(QGraphicsView):
                 event.accept()
                 
             elif self.current_tool in ("pen", "eraser"):
-                # ★ ペイント開始処理
+                # ペイント開始処理
                 if self.paint_item and self.paint_image:
                     self._is_painting = True
                     # 子アイテムであるpaint_item上のローカル座標に変換
@@ -305,7 +309,7 @@ class CustomGraphicsView(QGraphicsView):
             event.accept()
             
         elif self._is_painting:
-            # ★ ペイント中処理
+            # ペイント中処理
             scene_pos = self.mapToScene(event.position().toPoint())
             current_pos = self.paint_item.mapFromScene(scene_pos)
             
@@ -445,7 +449,7 @@ class PDFAdjuster(QMainWindow):
         control_layout.addLayout(angle_layout)
         
         self.grid_checkbox = QCheckBox("グリッドを表示")
-        self.grid_checkbox.setChecked(True)
+        self.grid_checkbox.setChecked(True) # デフォルトでON
         self.grid_checkbox.stateChanged.connect(self._on_grid_toggled)
         control_layout.addWidget(self.grid_checkbox)
         
@@ -470,7 +474,19 @@ class PDFAdjuster(QMainWindow):
         control_layout.addWidget(self.pen_btn)
         control_layout.addWidget(self.eraser_btn)
         
+        # 枠操作用コントロール
+        control_layout.addSpacing(10)
+        control_layout.addWidget(QLabel("枠の自動検出:"))
+        self.btn_auto_detect = QPushButton("現在のページの枠を自動検出")
+        self.btn_auto_detect.clicked.connect(self.auto_detect_crop_rect)
+        control_layout.addWidget(self.btn_auto_detect)
+        
+        self.btn_auto_detect_all = QPushButton("全ページの枠を自動検出")
+        self.btn_auto_detect_all.clicked.connect(self.auto_detect_all_pages)
+        control_layout.addWidget(self.btn_auto_detect_all)
+        
         # ペイント設定（色と太さ）
+        control_layout.addSpacing(10)
         paint_settings_layout = QHBoxLayout()
         paint_settings_layout.addWidget(QLabel("ペン色:"))
         self.btn_color = QPushButton()
@@ -542,6 +558,190 @@ class PDFAdjuster(QMainWindow):
         if self.current_page_num != -1:
             self.page_states[self.current_page_num]['crop_rect'] = new_rect
 
+    def auto_detect_crop_rect(self):
+        """現在のページのみ自動検出を実行する"""
+        if self.current_page_num == -1:
+            return
+        QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+        try:
+            rect = self._calculate_auto_crop_rect(self.current_page_num)
+            if rect:
+                self.on_crop_rect_drawn(rect)
+                self.select_btn.setChecked(True)
+            else:
+                QMessageBox.information(self, "情報", "明確なコンテンツを検出できませんでした。")
+        finally:
+            QApplication.restoreOverrideCursor()
+
+    def auto_detect_all_pages(self):
+        """全ページに対して自動検出を実行する"""
+        if not self.pdf_doc:
+            return
+            
+        reply = QMessageBox.question(self, "確認", 
+                                     "すべてのページに対して枠の自動検出を実行しますか？\n(現在の各ページの設定は上書きされます)", 
+                                     QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No, 
+                                     QMessageBox.StandardButton.No)
+        
+        if reply == QMessageBox.StandardButton.Yes:
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            try:
+                success_count = 0
+                for i in range(len(self.pdf_doc)):
+                    rect = self._calculate_auto_crop_rect(i)
+                    if rect:
+                        self.page_states[i]['crop_rect'] = rect
+                        success_count += 1
+                
+                # 現在の表示ページも更新
+                if self.current_page_num != -1:
+                    self.render_preview(self.current_page_num)
+                    
+                QMessageBox.information(self, "完了", f"全 {len(self.pdf_doc)} ページ中、{success_count} ページの枠を自動検出しました。")
+            finally:
+                QApplication.restoreOverrideCursor()
+
+    def _calculate_auto_crop_rect(self, page_num):
+        """指定したページのコンテンツ範囲をピクセル解析で自動計算する（拡張型アルゴリズム）"""
+        calc_scale = 0.25
+        page = self.pdf_doc[page_num]
+        pix = page.get_pixmap(matrix=fitz.Matrix(calc_scale, calc_scale), colorspace=fitz.csGRAY)
+        data = pix.samples
+        w = pix.width
+        h = pix.height
+        
+        # 閾値を少し緩めて、薄い文字もインクとして検出しやすくする
+        threshold = 200
+        
+        # 絶対に無視する外縁マージン (2%)
+        margin_x = int(w * 0.02)
+        margin_y = int(h * 0.02)
+        
+        # --- ステップ1: 確実なコア（メインコンテンツ）領域を見つける ---
+        # コアとして認めるための厳しい条件（幅・高さの1%以上の黒ピクセル）
+        core_req_x = max(3, int(w * 0.01))
+        core_req_y = max(3, int(h * 0.01))
+        
+        # 黒ずみ・影対策として、黒が多すぎる行/列は無視する上限 (50%)
+        max_pixels_x = int(w * 0.50)
+        max_pixels_y = int(h * 0.50)
+        
+        min_y = margin_y
+        max_y = h - margin_y
+        min_x = margin_x
+        max_x = w - margin_x
+        
+        # コア上端
+        for y in range(margin_y, h - margin_y):
+            row = data[y*w : (y+1)*w]
+            black_count = sum(1 for p in row if p < threshold)
+            if core_req_x <= black_count <= max_pixels_x:
+                min_y = y
+                break
+        
+        # コア下端
+        for y in range(h - margin_y - 1, margin_y, -1):
+            row = data[y*w : (y+1)*w]
+            black_count = sum(1 for p in row if p < threshold)
+            if core_req_x <= black_count <= max_pixels_x:
+                max_y = y
+                break
+                
+        # コア左端 (高さは min_y から max_y に限定してノイズを減らす)
+        for x in range(margin_x, w - margin_x):
+            col_core = data[x : w*h : w][min_y : max_y]
+            black_count = sum(1 for p in col_core if p < threshold)
+            if core_req_y <= black_count <= max_pixels_y:
+                min_x = x
+                break
+                
+        # コア右端
+        for x in range(w - margin_x - 1, margin_x, -1):
+            col_core = data[x : w*h : w][min_y : max_y]
+            black_count = sum(1 for p in col_core if p < threshold)
+            if core_req_y <= black_count <= max_pixels_y:
+                max_x = x
+                break
+
+        if min_x >= max_x or min_y >= max_y:
+            return None
+
+        # --- ステップ2: コアから外側へ向けて、緩い条件で領域を拡張する ---
+        # 拡張時の条件：数ピクセル（2px以上）のインクがあればコンテンツとみなす
+        loose_req = 2
+        # 連続して空白（または黒すぎるノイズ）が続いても許容する距離（ギャップ）。
+        # メインテキストから離れた注釈やページ番号を取り込むため、高さの8%、幅の8%程度まで許容。
+        max_gap_y = int(h * 0.08)
+        max_gap_x = int(w * 0.08)
+        
+        # 上方向へ拡張 (探索幅は min_x から max_x の間のみとし、横のノイズを避ける)
+        current_y = min_y - 1
+        gap = 0
+        while current_y >= margin_y and gap < max_gap_y:
+            row_slice = data[current_y*w + min_x : current_y*w + max_x]
+            black_count = sum(1 for p in row_slice if p < threshold)
+            if loose_req <= black_count <= max_pixels_x:
+                min_y = current_y
+                gap = 0 # インクを見つけたらギャップをリセット
+            else:
+                gap += 1
+            current_y -= 1
+            
+        # 下方向へ拡張
+        current_y = max_y + 1
+        gap = 0
+        while current_y < h - margin_y and gap < max_gap_y:
+            row_slice = data[current_y*w + min_x : current_y*w + max_x]
+            black_count = sum(1 for p in row_slice if p < threshold)
+            if loose_req <= black_count <= max_pixels_x:
+                max_y = current_y + 1
+                gap = 0
+            else:
+                gap += 1
+            current_y += 1
+            
+        # 左方向へ拡張 (探索高さは更新された min_y から max_y)
+        current_x = min_x - 1
+        gap = 0
+        while current_x >= margin_x and gap < max_gap_x:
+            col_slice = data[current_x : w*h : w][min_y : max_y]
+            black_count = sum(1 for p in col_slice if p < threshold)
+            if loose_req <= black_count <= max_pixels_y:
+                min_x = current_x
+                gap = 0
+            else:
+                gap += 1
+            current_x -= 1
+            
+        # 右方向へ拡張
+        current_x = max_x + 1
+        gap = 0
+        while current_x < w - margin_x and gap < max_gap_x:
+            col_slice = data[current_x : w*h : w][min_y : max_y]
+            black_count = sum(1 for p in col_slice if p < threshold)
+            if loose_req <= black_count <= max_pixels_y:
+                max_x = current_x + 1
+                gap = 0
+            else:
+                gap += 1
+            current_x += 1
+
+        # --- ステップ3: 2%のパディングを追加 ---
+        pad_x = int((max_x - min_x) * 0.02)
+        pad_y = int((max_y - min_y) * 0.02)
+        min_x = max(0, min_x - pad_x)
+        max_x = min(w, max_x + pad_x)
+        min_y = max(0, min_y - pad_y)
+        max_y = min(h, max_y + pad_y)
+
+        # キャンバスの表示スケールに変換
+        ratio = 4.0 / calc_scale
+        rect = QRectF(min_x * ratio, min_y * ratio, (max_x - min_x) * ratio, (max_y - min_y) * ratio)
+        
+        # ページ範囲をはみ出さないようにクリップ
+        rect = rect.intersected(self.scene.sceneRect())
+        return rect
+
     def open_pdf_dialog(self):
         file_path, _ = QFileDialog.getOpenFileName(self, "PDFを開く", "", "PDF Files (*.pdf)")
         if file_path:
@@ -561,6 +761,7 @@ class PDFAdjuster(QMainWindow):
         
         for i in range(len(self.pdf_doc)):
             page = self.pdf_doc[i]
+            # サムネイルは1.5倍で生成し綺麗に表示
             pix = page.get_pixmap(matrix=fitz.Matrix(1.5, 1.5))
             fmt = QImage.Format.Format_RGBA8888 if pix.alpha else QImage.Format.Format_RGB888
             qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
@@ -613,7 +814,7 @@ class PDFAdjuster(QMainWindow):
         self.image_item.setTransformOriginPoint(qpix.width() / 2, qpix.height() / 2)
         self.scene.addItem(self.image_item)
         
-        # ★ ペイントレイヤーの初期化・復元
+        # ペイントレイヤーの初期化・復元
         state = self.page_states[page_num]
         if state['paint_image'] is None:
             # まだ塗られていないページは、完全透明のQImageを作成する
@@ -696,7 +897,7 @@ class PDFAdjuster(QMainWindow):
                 fmt = QImage.Format.Format_RGBA8888 if pix.alpha else QImage.Format.Format_RGB888
                 qimg = QImage(pix.samples, pix.width, pix.height, pix.stride, fmt)
                 
-                # ★ 出力用の画像にペイント層を合成
+                # 出力用の画像にペイント層を合成
                 if paint_img:
                     painter = QPainter(qimg)
                     painter.drawImage(0, 0, paint_img)
